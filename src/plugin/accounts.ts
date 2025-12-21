@@ -1,6 +1,8 @@
 import { formatRefreshParts, parseRefreshParts } from "./auth";
-import { loadAccounts, saveAccounts, type AccountStorage } from "./storage";
+import { loadAccounts, saveAccounts, type AccountStorage, type RateLimitState, type ModelFamily } from "./storage";
 import type { OAuthAuthDetails, RefreshParts } from "./types";
+
+export type { ModelFamily } from "./storage";
 
 export interface ManagedAccount {
   index: number;
@@ -10,8 +12,8 @@ export interface ManagedAccount {
   parts: RefreshParts;
   access?: string;
   expires?: number;
-  isRateLimited: boolean;
-  rateLimitResetTime: number;
+  rateLimitResetTimes: RateLimitState;
+  lastSwitchReason?: "rate-limit" | "initial" | "rotation";
 }
 
 function nowMs(): number {
@@ -25,14 +27,36 @@ function clampNonNegativeInt(value: unknown, fallback: number): number {
   return value < 0 ? 0 : Math.floor(value);
 }
 
+function isRateLimitedForFamily(account: ManagedAccount, family: ModelFamily): boolean {
+  const resetTime = account.rateLimitResetTimes[family];
+  return resetTime !== undefined && nowMs() < resetTime;
+}
+
+function clearExpiredRateLimits(account: ManagedAccount): void {
+  const now = nowMs();
+  if (account.rateLimitResetTimes.claude !== undefined && now >= account.rateLimitResetTimes.claude) {
+    delete account.rateLimitResetTimes.claude;
+  }
+  if (account.rateLimitResetTimes.gemini !== undefined && now >= account.rateLimitResetTimes.gemini) {
+    delete account.rateLimitResetTimes.gemini;
+  }
+}
+
 /**
- * In-memory multi-account manager for round-robin routing.
+ * In-memory multi-account manager with sticky account selection.
+ *
+ * Uses the same account until it hits a rate limit (429), then switches.
+ * Rate limits are tracked per-model-family (claude/gemini) so an account
+ * rate-limited for Claude can still be used for Gemini.
  *
  * Source of truth for the pool is `antigravity-accounts.json`.
  */
 export class AccountManager {
   private accounts: ManagedAccount[] = [];
   private cursor = 0;
+  private currentAccountIndex = -1;
+  private lastToastAccountIndex = -1;
+  private lastToastTime = 0;
 
   static async loadFromDisk(authFallback?: OAuthAuthDetails): Promise<AccountManager> {
     const stored = await loadAccounts();
@@ -74,8 +98,8 @@ export class AccountManager {
             },
             access: matchesFallback ? authFallback?.access : undefined,
             expires: matchesFallback ? authFallback?.expires : undefined,
-            isRateLimited: !!acc.isRateLimited,
-            rateLimitResetTime: clampNonNegativeInt(acc.rateLimitResetTime, 0),
+            rateLimitResetTimes: acc.rateLimitResetTimes ?? {},
+            lastSwitchReason: acc.lastSwitchReason,
           };
         })
         .filter((a): a is ManagedAccount => a !== null);
@@ -83,6 +107,7 @@ export class AccountManager {
       this.cursor = clampNonNegativeInt(stored.activeIndex, 0);
       if (this.accounts.length > 0) {
         this.cursor = this.cursor % this.accounts.length;
+        this.currentAccountIndex = this.cursor;
       }
 
       return;
@@ -101,11 +126,11 @@ export class AccountManager {
             parts,
             access: authFallback.access,
             expires: authFallback.expires,
-            isRateLimited: false,
-            rateLimitResetTime: 0,
+            rateLimitResetTimes: {},
           },
         ];
         this.cursor = 0;
+        this.currentAccountIndex = 0;
       }
     }
   }
@@ -115,49 +140,73 @@ export class AccountManager {
   }
 
   getAccountsSnapshot(): ManagedAccount[] {
-    return this.accounts.map((a) => ({ ...a, parts: { ...a.parts } }));
+    return this.accounts.map((a) => ({ ...a, parts: { ...a.parts }, rateLimitResetTimes: { ...a.rateLimitResetTimes } }));
   }
 
-  /**
-   * Picks the next available account (round-robin), skipping accounts in cooldown.
-   */
-  pickNext(): ManagedAccount | null {
-    const total = this.accounts.length;
-    if (total === 0) {
-      return null;
+  getCurrentAccount(): ManagedAccount | null {
+    if (this.currentAccountIndex >= 0 && this.currentAccountIndex < this.accounts.length) {
+      return this.accounts[this.currentAccountIndex] ?? null;
     }
-
-    const now = nowMs();
-
-    // Clear expired cooldowns.
-    for (const acc of this.accounts) {
-      if (acc.isRateLimited && acc.rateLimitResetTime > 0 && now > acc.rateLimitResetTime) {
-        acc.isRateLimited = false;
-        acc.rateLimitResetTime = 0;
-      }
-    }
-
-    for (let i = 0; i < total; i++) {
-      const idx = (this.cursor + i) % total;
-      const candidate = this.accounts[idx];
-      if (!candidate) {
-        continue;
-      }
-      if (candidate.isRateLimited) {
-        continue;
-      }
-      this.cursor = (idx + 1) % total;
-      candidate.lastUsed = now;
-      return candidate;
-    }
-
     return null;
   }
 
-  markRateLimited(account: ManagedAccount, retryAfterMs: number): void {
-    const duration = clampNonNegativeInt(retryAfterMs, 0);
-    account.isRateLimited = true;
-    account.rateLimitResetTime = nowMs() + duration;
+  markSwitched(account: ManagedAccount, reason: "rate-limit" | "initial" | "rotation"): void {
+    account.lastSwitchReason = reason;
+    this.currentAccountIndex = account.index;
+  }
+
+  shouldShowAccountToast(accountIndex: number, debounceMs = 30000): boolean {
+    const now = nowMs();
+    if (accountIndex === this.lastToastAccountIndex && now - this.lastToastTime < debounceMs) {
+      return false;
+    }
+    return true;
+  }
+
+  markToastShown(accountIndex: number): void {
+    this.lastToastAccountIndex = accountIndex;
+    this.lastToastTime = nowMs();
+  }
+
+  getCurrentOrNextForFamily(family: ModelFamily): ManagedAccount | null {
+    const current = this.getCurrentAccount();
+    if (current) {
+      clearExpiredRateLimits(current);
+      if (!isRateLimitedForFamily(current, family)) {
+        current.lastUsed = nowMs();
+        return current;
+      }
+    }
+
+    const next = this.getNextForFamily(family);
+    if (next) {
+      this.currentAccountIndex = next.index;
+    }
+    return next;
+  }
+
+  getNextForFamily(family: ModelFamily): ManagedAccount | null {
+    const available = this.accounts.filter((a) => {
+      clearExpiredRateLimits(a);
+      return !isRateLimitedForFamily(a, family);
+    });
+
+    if (available.length === 0) {
+      return null;
+    }
+
+    const account = available[this.cursor % available.length];
+    if (!account) {
+      return null;
+    }
+
+    this.cursor++;
+    account.lastUsed = nowMs();
+    return account;
+  }
+
+  markRateLimited(account: ManagedAccount, retryAfterMs: number, family: ModelFamily): void {
+    account.rateLimitResetTimes[family] = nowMs() + retryAfterMs;
   }
 
   removeAccount(account: ManagedAccount): boolean {
@@ -173,6 +222,7 @@ export class AccountManager {
 
     if (this.accounts.length === 0) {
       this.cursor = 0;
+      this.currentAccountIndex = -1;
       return true;
     }
 
@@ -180,6 +230,13 @@ export class AccountManager {
       this.cursor -= 1;
     }
     this.cursor = this.cursor % this.accounts.length;
+
+    if (this.currentAccountIndex > idx) {
+      this.currentAccountIndex -= 1;
+    }
+    if (this.currentAccountIndex >= this.accounts.length) {
+      this.currentAccountIndex = -1;
+    }
 
     return true;
   }
@@ -200,32 +257,30 @@ export class AccountManager {
     };
   }
 
-  getMinWaitTimeMs(): number {
-    const now = nowMs();
-    
-    // Clear expired cooldowns first (same logic as pickNext)
-    for (const acc of this.accounts) {
-      if (acc.isRateLimited && acc.rateLimitResetTime > 0 && now > acc.rateLimitResetTime) {
-        acc.isRateLimited = false;
-        acc.rateLimitResetTime = 0;
-      }
-    }
-    
-    const available = this.accounts.some((a) => !a.isRateLimited);
-    if (available) {
+  getMinWaitTimeForFamily(family: ModelFamily): number {
+    const available = this.accounts.filter((a) => {
+      clearExpiredRateLimits(a);
+      return !isRateLimitedForFamily(a, family);
+    });
+    if (available.length > 0) {
       return 0;
     }
 
-    const waits = this.accounts
-      .filter((a) => a.isRateLimited && a.rateLimitResetTime > 0)
-      .map((a) => Math.max(0, a.rateLimitResetTime - now));
+    const waitTimes = this.accounts
+      .map((a) => a.rateLimitResetTimes[family])
+      .filter((t): t is number => t !== undefined)
+      .map((t) => Math.max(0, t - nowMs()));
 
-    return waits.length > 0 ? Math.min(...waits) : 0;
+    return waitTimes.length > 0 ? Math.min(...waitTimes) : 0;
+  }
+
+  getAccounts(): ManagedAccount[] {
+    return [...this.accounts];
   }
 
   async saveToDisk(): Promise<void> {
     const storage: AccountStorage = {
-      version: 1,
+      version: 2,
       accounts: this.accounts.map((a) => ({
         email: a.email,
         refreshToken: a.parts.refreshToken,
@@ -233,10 +288,10 @@ export class AccountManager {
         managedProjectId: a.parts.managedProjectId,
         addedAt: a.addedAt,
         lastUsed: a.lastUsed,
-        isRateLimited: a.isRateLimited,
-        rateLimitResetTime: a.rateLimitResetTime,
+        lastSwitchReason: a.lastSwitchReason,
+        rateLimitResetTimes: Object.keys(a.rateLimitResetTimes).length > 0 ? a.rateLimitResetTimes : undefined,
       })),
-      activeIndex: this.cursor,
+      activeIndex: Math.max(0, this.currentAccountIndex),
     };
 
     await saveAccounts(storage);

@@ -5,8 +5,19 @@ import type { AntigravityTokenExchangeResult } from "./antigravity/oauth";
 import { accessTokenExpired, isOAuthAuth, parseRefreshParts } from "./plugin/auth";
 import { promptAddAnotherAccount, promptLoginMode, promptProjectId } from "./plugin/cli";
 import { ensureProjectContext } from "./plugin/project";
-import { startAntigravityDebugRequest } from "./plugin/debug";
 import {
+  startAntigravityDebugRequest, 
+  logAntigravityDebugResponse,
+  logAccountContext,
+  logRateLimitEvent,
+  logRateLimitSnapshot,
+  logResponseBody,
+  logModelFamily,
+  isDebugEnabled,
+  getLogFilePath,
+} from "./plugin/debug";
+import {
+  buildThinkingWarmupBody,
   isGenerativeLanguageRequest,
   prepareAntigravityRequest,
   transformAntigravityResponse,
@@ -14,7 +25,8 @@ import {
 import { AntigravityTokenRefreshError, refreshAccessToken } from "./plugin/token";
 import { startOAuthListener, type OAuthListener } from "./plugin/server";
 import { clearAccounts, loadAccounts, saveAccounts } from "./plugin/storage";
-import { AccountManager } from "./plugin/accounts";
+import { AccountManager, type ModelFamily } from "./plugin/accounts";
+import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker";
 import type {
   GetAuth,
   LoaderResult,
@@ -25,6 +37,24 @@ import type {
 } from "./plugin/types";
 
 const MAX_OAUTH_ACCOUNTS = 10;
+const MAX_WARMUP_SESSIONS = 1000;
+const warmupAttemptedSessionIds = new Set<string>();
+
+function trackWarmupSession(sessionId: string): boolean {
+  if (warmupAttemptedSessionIds.has(sessionId)) {
+    return false;
+  }
+  if (warmupAttemptedSessionIds.size >= MAX_WARMUP_SESSIONS) {
+    const first = warmupAttemptedSessionIds.values().next().value;
+    if (first) warmupAttemptedSessionIds.delete(first);
+  }
+  warmupAttemptedSessionIds.add(sessionId);
+  return true;
+}
+
+function untrackWarmupSession(sessionId: string): void {
+  warmupAttemptedSessionIds.delete(sessionId);
+}
 
 async function openBrowser(url: string): Promise<void> {
   try {
@@ -165,8 +195,6 @@ async function persistAccountPool(
         managedProjectId: parts.managedProjectId,
         addedAt: now,
         lastUsed: now,
-        isRateLimited: false,
-        rateLimitResetTime: 0,
       });
       continue;
     }
@@ -205,7 +233,7 @@ async function persistAccountPool(
     : (typeof stored?.activeIndex === "number" && Number.isFinite(stored.activeIndex) ? stored.activeIndex : 0);
 
   await saveAccounts({
-    version: 1,
+    version: 2,
     accounts,
     activeIndex: clampInt(activeIndex, 0, accounts.length - 1),
   });
@@ -229,6 +257,145 @@ function retryAfterMsFromResponse(response: Response): number {
   }
 
   return 60_000;
+}
+
+function parseDurationToMs(duration: string): number | null {
+  const match = duration.match(/^(\d+(?:\.\d+)?)(s|m|h)?$/i);
+  if (!match) return null;
+  const value = parseFloat(match[1]!);
+  const unit = (match[2] || "s").toLowerCase();
+  switch (unit) {
+    case "h": return value * 3600 * 1000;
+    case "m": return value * 60 * 1000;
+    case "s": return value * 1000;
+    default: return value * 1000;
+  }
+}
+
+interface RateLimitBodyInfo {
+  retryDelayMs: number | null;
+  message?: string;
+  quotaResetTime?: string;
+  reason?: string;
+}
+
+function extractRateLimitBodyInfo(body: unknown): RateLimitBodyInfo {
+  if (!body || typeof body !== "object") {
+    return { retryDelayMs: null };
+  }
+
+  const error = (body as { error?: unknown }).error;
+  const message = error && typeof error === "object" 
+    ? (error as { message?: string }).message 
+    : undefined;
+
+  const details = error && typeof error === "object" 
+    ? (error as { details?: unknown[] }).details 
+    : undefined;
+
+  let reason: string | undefined;
+  if (Array.isArray(details)) {
+    for (const detail of details) {
+      if (!detail || typeof detail !== "object") continue;
+      const type = (detail as { "@type"?: string })["@type"];
+      if (typeof type === "string" && type.includes("google.rpc.ErrorInfo")) {
+        const detailReason = (detail as { reason?: string }).reason;
+        if (typeof detailReason === "string") {
+          reason = detailReason;
+          break;
+        }
+      }
+    }
+
+    for (const detail of details) {
+      if (!detail || typeof detail !== "object") continue;
+      const type = (detail as { "@type"?: string })["@type"];
+      if (typeof type === "string" && type.includes("google.rpc.RetryInfo")) {
+        const retryDelay = (detail as { retryDelay?: string }).retryDelay;
+        if (typeof retryDelay === "string") {
+          const retryDelayMs = parseDurationToMs(retryDelay);
+          if (retryDelayMs !== null) {
+            return { retryDelayMs, message, reason };
+          }
+        }
+      }
+    }
+
+    for (const detail of details) {
+      if (!detail || typeof detail !== "object") continue;
+      const metadata = (detail as { metadata?: Record<string, string> }).metadata;
+      if (metadata && typeof metadata === "object") {
+        const quotaResetDelay = metadata.quotaResetDelay;
+        const quotaResetTime = metadata.quotaResetTimeStamp;
+        if (typeof quotaResetDelay === "string") {
+          const quotaResetDelayMs = parseDurationToMs(quotaResetDelay);
+          if (quotaResetDelayMs !== null) {
+            return { retryDelayMs: quotaResetDelayMs, message, quotaResetTime, reason };
+          }
+        }
+      }
+    }
+  }
+
+  if (message) {
+    const afterMatch = message.match(/reset after\s+([0-9hms.]+)/i);
+    const rawDuration = afterMatch?.[1];
+    if (rawDuration) {
+      const parsed = parseDurationToMs(rawDuration);
+      if (parsed !== null) {
+        return { retryDelayMs: parsed, message, reason };
+      }
+    }
+  }
+
+  return { retryDelayMs: null, message, reason };
+}
+
+async function extractRetryInfoFromBody(response: Response): Promise<RateLimitBodyInfo> {
+  try {
+    const text = await response.clone().text();
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      return extractRateLimitBodyInfo(parsed);
+    } catch {
+      return { retryDelayMs: null };
+    }
+  } catch {
+    return { retryDelayMs: null };
+  }
+}
+
+function formatWaitTime(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const seconds = Math.ceil(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) {
+    return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
+
+const SHORT_RETRY_THRESHOLD_MS = 5000;
+
+const rateLimitStateByAccount = new Map<number, { consecutive429: number; lastAt: number }>();
+
+function getRateLimitBackoff(accountIndex: number, serverRetryAfterMs: number | null): { attempt: number; delayMs: number } {
+  const now = Date.now();
+  const previous = rateLimitStateByAccount.get(accountIndex);
+  const attempt = previous && (now - previous.lastAt < 120_000) ? previous.consecutive429 + 1 : 1;
+  rateLimitStateByAccount.set(accountIndex, { consecutive429: attempt, lastAt: now });
+  
+  const baseDelay = serverRetryAfterMs ?? 1000;
+  const backoffDelay = Math.min(baseDelay * Math.pow(2, attempt - 1), 60_000);
+  return { attempt, delayMs: Math.max(baseDelay, backoffDelay) };
+}
+
+function resetRateLimitState(accountIndex: number): void {
+  rateLimitStateByAccount.delete(accountIndex);
 }
 
 /**
@@ -264,9 +431,16 @@ function sleep(ms: number, signal?: AbortSignal | null): Promise<void> {
  * Creates an Antigravity OAuth plugin for a specific provider ID.
  */
 export const createAntigravityPlugin = (providerId: string) => async (
-  { client }: PluginContext,
-): Promise<PluginResult> => ({
-  auth: {
+  { client, directory }: PluginContext,
+): Promise<PluginResult> => {
+  const updateChecker = createAutoUpdateCheckerHook(client, directory, {
+    showStartupToast: true,
+    autoUpdate: true,
+  });
+
+  return {
+    event: updateChecker.event,
+    auth: {
     provider: providerId,
     loader: async (getAuth: GetAuth, provider: Provider): Promise<LoaderResult | Record<string, unknown>> => {
       const auth = await getAuth();
@@ -314,6 +488,19 @@ export const createAntigravityPlugin = (providerId: string) => async (
         }
       }
 
+      if (isDebugEnabled()) {
+        const logPath = getLogFilePath();
+        if (logPath) {
+          try {
+            await client.tui.showToast({
+              body: { message: `Debug log: ${logPath}`, variant: "info" },
+            });
+          } catch {
+            // TUI may not be available
+          }
+        }
+      }
+
       if (provider.models) {
         for (const model of Object.values(provider.models)) {
           if (model) {
@@ -342,6 +529,15 @@ export const createAntigravityPlugin = (providerId: string) => async (
             throw new Error("No Antigravity accounts configured. Run `opencode auth login`.");
           }
 
+          const urlString = toUrlString(input);
+          const family = getModelFamilyFromUrl(urlString);
+          const debugLines: string[] = [];
+          const pushDebug = (line: string) => {
+            if (!isDebugEnabled()) return;
+            debugLines.push(line);
+          };
+          pushDebug(`request=${urlString}`);
+
           type FailureContext = {
             response: Response;
             streaming: boolean;
@@ -359,10 +555,6 @@ export const createAntigravityPlugin = (providerId: string) => async (
           let lastFailure: FailureContext | null = null;
           let lastError: Error | null = null;
           const abortSignal = init?.signal ?? undefined;
-          
-          // Track which account was used in this request for detecting switches
-          // This is scoped to the fetch call so it resets per-request
-          let previousAccountIndex: number | null = null;
 
           // Helper to check if request was aborted
           const checkAborted = () => {
@@ -385,6 +577,8 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
           // Use while(true) loop to handle rate limits with backoff
           // This ensures we wait and retry when all accounts are rate-limited
+          const quietMode = process.env.OPENCODE_ANTIGRAVITY_QUIET === "1";
+          
           while (true) {
             // Check for abort at the start of each iteration
             checkAborted();
@@ -395,30 +589,52 @@ export const createAntigravityPlugin = (providerId: string) => async (
               throw new Error("No Antigravity accounts available. Run `opencode auth login`.");
             }
 
-            const account = accountManager.pickNext();
+            const account = accountManager.getCurrentOrNextForFamily(family);
             
             if (!account) {
               // All accounts are rate-limited - wait and retry
-              const waitMs = accountManager.getMinWaitTimeMs() || 60_000;
+              const waitMs = accountManager.getMinWaitTimeForFamily(family) || 60_000;
               const waitSec = Math.max(1, Math.ceil(waitMs / 1000));
 
-              await showToast(`All ${accountCount} account(s) rate-limited. Waiting ${waitSec}s...`, "warning");
+              pushDebug(`all-rate-limited family=${family} accounts=${accountCount}`);
+              if (isDebugEnabled()) {
+                logAccountContext("All accounts rate-limited", {
+                  index: -1,
+                  family,
+                  totalAccounts: accountCount,
+                });
+                logRateLimitSnapshot(family, accountManager.getAccountsSnapshot());
+              }
+
+              await showToast(`All ${accountCount} account(s) rate-limited for ${family}. Waiting ${waitSec}s...`, "warning");
 
               // Wait for the cooldown to expire
               await sleep(waitMs, abortSignal);
               continue;
             }
 
-            // Show toast when switching to a different account
-            const isAccountSwitch = previousAccountIndex !== null && previousAccountIndex !== account.index;
-            if ((isAccountSwitch || previousAccountIndex === null) && accountCount > 1) {
+            pushDebug(
+              `selected idx=${account.index} email=${account.email ?? ""} family=${family} accounts=${accountCount}`,
+            );
+            if (isDebugEnabled()) {
+              logAccountContext("Selected", {
+                index: account.index,
+                email: account.email,
+                family,
+                totalAccounts: accountCount,
+                rateLimitState: account.rateLimitResetTimes,
+              });
+            }
+
+            // Show toast when switching to a different account (debounced, respects quiet mode)
+            if (!quietMode && accountCount > 1 && accountManager.shouldShowAccountToast(account.index)) {
               const accountLabel = account.email || `Account ${account.index + 1}`;
               await showToast(
-                `Using ${accountLabel}${accountCount > 1 ? ` (${account.index + 1}/${accountCount})` : ""}`,
+                `Using ${accountLabel} (${account.index + 1}/${accountCount})`,
                 "info"
               );
+              accountManager.markToastShown(account.index);
             }
-            previousAccountIndex = account.index;
 
             try {
               await accountManager.saveToDisk();
@@ -507,6 +723,70 @@ export const createAntigravityPlugin = (providerId: string) => async (
               }
             }
 
+            const runThinkingWarmup = async (
+              prepared: ReturnType<typeof prepareAntigravityRequest>,
+              projectId: string,
+            ): Promise<void> => {
+              if (!prepared.needsSignedThinkingWarmup || !prepared.sessionId) {
+                return;
+              }
+
+              if (!trackWarmupSession(prepared.sessionId)) {
+                return;
+              }
+
+              const warmupBody = buildThinkingWarmupBody(
+                typeof prepared.init.body === "string" ? prepared.init.body : undefined,
+                Boolean(prepared.effectiveModel?.toLowerCase().includes("claude") && prepared.effectiveModel?.toLowerCase().includes("thinking")),
+              );
+              if (!warmupBody) {
+                return;
+              }
+
+              const warmupUrl = toWarmupStreamUrl(prepared.request);
+              const warmupHeaders = new Headers(prepared.init.headers ?? {});
+              warmupHeaders.set("accept", "text/event-stream");
+
+              const warmupInit: RequestInit = {
+                ...prepared.init,
+                method: prepared.init.method ?? "POST",
+                headers: warmupHeaders,
+                body: warmupBody,
+              };
+
+              const warmupDebugContext = startAntigravityDebugRequest({
+                originalUrl: warmupUrl,
+                resolvedUrl: warmupUrl,
+                method: warmupInit.method,
+                headers: warmupHeaders,
+                body: warmupBody,
+                streaming: true,
+                projectId,
+              });
+
+              try {
+                pushDebug("thinking-warmup: start");
+                const warmupResponse = await fetch(warmupUrl, warmupInit);
+                const transformed = await transformAntigravityResponse(
+                  warmupResponse,
+                  true,
+                  warmupDebugContext,
+                  prepared.requestedModel,
+                  projectId,
+                  warmupUrl,
+                  prepared.effectiveModel,
+                  prepared.sessionId,
+                );
+                await transformed.text();
+                pushDebug("thinking-warmup: done");
+              } catch (error) {
+                untrackWarmupSession(prepared.sessionId);
+                pushDebug(
+                  `thinking-warmup: failed ${error instanceof Error ? error.message : String(error)}`,
+                );
+              }
+            };
+
             // Try endpoint fallbacks
             let shouldSwitchAccount = false;
             
@@ -524,6 +804,8 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
                 const originalUrl = toUrlString(input);
                 const resolvedUrl = toUrlString(prepared.request);
+                pushDebug(`endpoint=${currentEndpoint}`);
+                pushDebug(`resolved=${resolvedUrl}`);
                 const debugContext = startAntigravityDebugRequest({
                   originalUrl,
                   resolvedUrl,
@@ -534,12 +816,72 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   projectId: projectContext.effectiveProjectId,
                 });
 
-                const response = await fetch(prepared.request, prepared.init);
+                await runThinkingWarmup(prepared, projectContext.effectiveProjectId);
 
-                // Handle 429 rate limit
+                const response = await fetch(prepared.request, prepared.init);
+                pushDebug(`status=${response.status} ${response.statusText}`);
+
+
+
+
+                // Handle 429 rate limit with improved logic
                 if (response.status === 429) {
-                  const retryAfterMs = retryAfterMsFromResponse(response);
-                  accountManager.markRateLimited(account, retryAfterMs);
+                  const headerRetryMs = retryAfterMsFromResponse(response);
+                  const bodyInfo = await extractRetryInfoFromBody(response);
+                  const serverRetryMs = bodyInfo.retryDelayMs ?? headerRetryMs;
+                  const { attempt, delayMs } = getRateLimitBackoff(account.index, serverRetryMs);
+
+                  const waitTimeFormatted = formatWaitTime(delayMs);
+                  const isCapacityExhausted =
+                    bodyInfo.reason === "MODEL_CAPACITY_EXHAUSTED" ||
+                    (typeof bodyInfo.message === "string" && bodyInfo.message.toLowerCase().includes("no capacity"));
+
+                  pushDebug(
+                    `429 idx=${account.index} email=${account.email ?? ""} family=${family} delayMs=${delayMs} attempt=${attempt}`,
+                  );
+                  if (bodyInfo.message) {
+                    pushDebug(`429 message=${bodyInfo.message}`);
+                  }
+                  if (bodyInfo.quotaResetTime) {
+                    pushDebug(`429 quotaResetTime=${bodyInfo.quotaResetTime}`);
+                  }
+                  if (bodyInfo.reason) {
+                    pushDebug(`429 reason=${bodyInfo.reason}`);
+                  }
+
+                  logRateLimitEvent(
+                    account.index,
+                    account.email,
+                    family,
+                    response.status,
+                    delayMs,
+                    bodyInfo,
+                  );
+
+                  await logResponseBody(debugContext, response, 429);
+
+                  if (isCapacityExhausted) {
+                    accountManager.markRateLimited(account, delayMs, family);
+                    await showToast(
+                      `Model capacity exhausted for ${family}. Retrying in ${waitTimeFormatted} (attempt ${attempt})...`,
+                      "warning",
+                    );
+                    await sleep(delayMs, abortSignal);
+                    continue;
+                  }
+                  
+                  const accountLabel = account.email || `Account ${account.index + 1}`;
+
+                  // Short retry: if delay is small, just wait and retry same account
+                  if (delayMs <= SHORT_RETRY_THRESHOLD_MS) {
+                    await showToast(`Rate limited. Retrying in ${waitTimeFormatted} (attempt ${attempt})...`, "warning");
+                    await sleep(delayMs, abortSignal);
+                    continue;
+                  }
+
+
+                  // Mark account as rate-limited for this family
+                  accountManager.markRateLimited(account, delayMs, family);
 
                   try {
                     await accountManager.saveToDisk();
@@ -547,11 +889,11 @@ export const createAntigravityPlugin = (providerId: string) => async (
                     console.error("[opencode-antigravity-auth] Failed to persist rate-limit state:", error);
                   }
 
-                  const accountLabel = account.email || `Account ${account.index + 1}`;
-                  
-                  if (accountManager.getAccountCount() > 1) {
-                    // Multiple accounts - switch to next
-                    await showToast(`Rate limited on ${accountLabel}. Switching...`, "warning");
+                  if (accountCount > 1) {
+                    const quotaMsg = bodyInfo.quotaResetTime 
+                      ? ` (quota resets ${bodyInfo.quotaResetTime})`
+                      : ` (retry in ${waitTimeFormatted})`;
+                    await showToast(`Rate limited on ${accountLabel}${quotaMsg}. Switching...`, "warning");
                     
                     lastFailure = {
                       response,
@@ -569,9 +911,10 @@ export const createAntigravityPlugin = (providerId: string) => async (
                     shouldSwitchAccount = true;
                     break;
                   } else {
-                    // Single account - wait and retry
-                    const waitSec = Math.max(1, Math.ceil(retryAfterMs / 1000));
-                    await showToast(`Rate limited. Waiting ${waitSec}s...`, "warning");
+                    const quotaMsg = bodyInfo.quotaResetTime 
+                      ? `Quota resets ${bodyInfo.quotaResetTime}`
+                      : `Waiting ${waitTimeFormatted}`;
+                    await showToast(`Rate limited. ${quotaMsg} (attempt ${attempt})...`, "warning");
                     
                     lastFailure = {
                       response,
@@ -587,18 +930,24 @@ export const createAntigravityPlugin = (providerId: string) => async (
                       toolDebugPayload: prepared.toolDebugPayload,
                     };
                     
-                    // Wait and let the outer loop retry
-                    await sleep(retryAfterMs, abortSignal);
+                    await sleep(delayMs, abortSignal);
                     shouldSwitchAccount = true;
                     break;
                   }
                 }
+
+                // Success - reset rate limit backoff state
+                resetRateLimitState(account.index);
 
                 const shouldRetryEndpoint = (
                   response.status === 403 ||
                   response.status === 404 ||
                   response.status >= 500
                 );
+
+                if (shouldRetryEndpoint) {
+                  await logResponseBody(debugContext, response, response.status);
+                }
 
                 if (shouldRetryEndpoint && i < ANTIGRAVITY_ENDPOINT_FALLBACKS.length - 1) {
                   lastFailure = {
@@ -618,6 +967,12 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 }
 
                 // Success or non-retryable error - return the response
+                logAntigravityDebugResponse(debugContext, response, {
+                  note: response.ok ? "Success" : `Error ${response.status}`,
+                });
+                if (!response.ok) {
+                  await logResponseBody(debugContext, response, response.status);
+                }
                 return transformAntigravityResponse(
                   response,
                   prepared.streaming,
@@ -630,6 +985,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   prepared.toolDebugMissing,
                   prepared.toolDebugSummary,
                   prepared.toolDebugPayload,
+                  debugLines,
                 );
               } catch (error) {
                 if (i < ANTIGRAVITY_ENDPOINT_FALLBACKS.length - 1) {
@@ -662,6 +1018,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 lastFailure.toolDebugMissing,
                 lastFailure.toolDebugSummary,
                 lastFailure.toolDebugPayload,
+                debugLines,
               );
             }
 
@@ -989,7 +1346,8 @@ export const createAntigravityPlugin = (providerId: string) => async (
       },
     ],
   },
-});
+  };
+};
 
 export const AntigravityCLIOAuthPlugin = createAntigravityPlugin(ANTIGRAVITY_PROVIDER_ID);
 export const GoogleOAuthPlugin = AntigravityCLIOAuthPlugin;
@@ -1003,4 +1361,35 @@ function toUrlString(value: RequestInfo): string {
     return candidate;
   }
   return value.toString();
+}
+
+function toWarmupStreamUrl(value: RequestInfo): string {
+  const urlString = toUrlString(value);
+  try {
+    const url = new URL(urlString);
+    if (!url.pathname.includes(":streamGenerateContent")) {
+      url.pathname = url.pathname.replace(":generateContent", ":streamGenerateContent");
+    }
+    url.searchParams.set("alt", "sse");
+    return url.toString();
+  } catch {
+    return urlString;
+  }
+}
+
+function extractModelFromUrl(urlString: string): string | null {
+  const match = urlString.match(/\/models\/([^:\/?]+)(?::\w+)?/);
+  return match?.[1] ?? null;
+}
+
+function getModelFamilyFromUrl(urlString: string): ModelFamily {
+  const model = extractModelFromUrl(urlString);
+  let family: ModelFamily = "gemini";
+  if (model && model.includes("claude")) {
+    family = "claude";
+  }
+  if (isDebugEnabled()) {
+    logModelFamily(urlString, model, family);
+  }
+  return family;
 }
