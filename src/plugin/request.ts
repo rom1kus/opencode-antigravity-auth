@@ -13,6 +13,7 @@ import {
   type AntigravityDebugContext,
 } from "./debug";
 import {
+  cleanJSONSchemaForAntigravity,
   DEFAULT_THINKING_BUDGET,
   deepFilterThinkingBlocks,
   extractThinkingConfig,
@@ -824,14 +825,16 @@ export function prepareAntigravityRequest(
           stripInjectedDebugFromRequestPayload(req as Record<string, unknown>);
 
           if (isClaudeModel) {
+            // Step 1: Strip corrupted/unsigned thinking blocks FIRST
+            deepFilterThinkingBlocks(req, signatureSessionKey, getCachedSignature, true);
+
+            // Step 2: THEN inject signed thinking from cache (after stripping)
             if (isClaudeThinkingModel && Array.isArray((req as any).contents)) {
               (req as any).contents = ensureThinkingBeforeToolUseInContents((req as any).contents, signatureSessionKey);
             }
             if (isClaudeThinkingModel && Array.isArray((req as any).messages)) {
               (req as any).messages = ensureThinkingBeforeToolUseInMessages((req as any).messages, signatureSessionKey);
             }
-
-            deepFilterThinkingBlocks(req, signatureSessionKey, getCachedSignature);
           }
         }
 
@@ -1007,70 +1010,7 @@ export function prepareAntigravityRequest(
             const functionDeclarations: any[] = [];
             const passthroughTools: any[] = [];
 
-            // Sanitize schema using ALLOWLIST approach - only keep basic features needed for function calling
-            // This is more aggressive than blocklisting, ensuring any unknown/unsupported features are stripped
-            // See docs/ANTIGRAVITY_API_SPEC.md for full list of unsupported features
-            const sanitizeSchema = (schema: any): any => {
-              if (!schema || typeof schema !== "object") {
-                return schema;
-              }
-
-              // Only keep these basic schema features (allowlist approach)
-              // Everything else gets stripped automatically
-              const ALLOWED_KEYS = new Set([
-                "type",
-                "properties",
-                "required",
-                "description",
-                "enum",
-                "items",
-                "additionalProperties",
-              ]);
-
-              const sanitized: any = {};
-
-              for (const key of Object.keys(schema)) {
-                // Convert "const" to "enum: [value]" (const is not supported but enum is)
-                if (key === "const") {
-                  sanitized.enum = [schema[key]];
-                  continue;
-                }
-
-                // Skip keys not in allowlist
-                if (!ALLOWED_KEYS.has(key)) {
-                  continue;
-                }
-
-                const value = schema[key];
-
-                if (key === "items" && value && typeof value === "object") {
-                  const sanitizedItems = sanitizeSchema(value);
-                  // Empty items schema {} is invalid - convert to permissive string type
-                  if (Object.keys(sanitizedItems).length === 0) {
-                    sanitized.items = { type: "string" };
-                  } else {
-                    sanitized.items = sanitizedItems;
-                  }
-                } else if (key === "properties" && value && typeof value === "object") {
-                  // Recursively sanitize properties
-                  sanitized.properties = {};
-                  for (const propKey of Object.keys(value)) {
-                    sanitized.properties[propKey] = sanitizeSchema(value[propKey]);
-                  }
-                } else if (key === "additionalProperties" && value && typeof value === "object") {
-                  sanitized.additionalProperties = sanitizeSchema(value);
-                } else {
-                  sanitized[key] = value;
-                }
-              }
-
-              return sanitized;
-            };
-
             const normalizeSchema = (schema: any) => {
-              // Helper to create a placeholder schema for empty parameter tools
-              // Antigravity API in VALIDATED mode cannot handle truly empty schemas
-              // The placeholder must be REQUIRED so the model sends a non-empty args object
               const createPlaceholderSchema = (base: any = {}) => ({
                 ...base,
                 type: "object",
@@ -1085,21 +1025,19 @@ export function prepareAntigravityRequest(
 
               if (!schema || typeof schema !== "object") {
                 toolDebugMissing += 1;
-                // Fallback for tools without schemas - add dummy property for Antigravity API
                 return createPlaceholderSchema();
               }
 
-              const sanitized = sanitizeSchema(schema);
+              const cleaned = cleanJSONSchemaForAntigravity(schema);
 
-              // Check if schema is effectively empty (type: object with no properties)
               if (
-                sanitized.type === "object" &&
-                (!sanitized.properties || Object.keys(sanitized.properties).length === 0)
+                cleaned.type === "object" &&
+                (!cleaned.properties || Object.keys(cleaned.properties).length === 0)
               ) {
-                return createPlaceholderSchema(sanitized);
+                return createPlaceholderSchema(cleaned);
               }
 
-              return sanitized;
+              return cleaned;
             };
 
             requestPayload.tools.forEach((tool: any, idx: number) => {
@@ -1246,6 +1184,10 @@ export function prepareAntigravityRequest(
         // Attempts to restore signatures from cache for multi-turn conversations
         // Handle both Gemini-style contents[] and Anthropic-style messages[] payloads.
         if (isClaudeModel) {
+          // Step 1: Strip corrupted/unsigned thinking blocks FIRST
+          deepFilterThinkingBlocks(requestPayload, signatureSessionKey, getCachedSignature, true);
+
+          // Step 2: THEN inject signed thinking from cache (after stripping)
           if (isClaudeThinkingModel && Array.isArray(requestPayload.contents)) {
             requestPayload.contents = ensureThinkingBeforeToolUseInContents(requestPayload.contents, signatureSessionKey);
           }
@@ -1253,8 +1195,7 @@ export function prepareAntigravityRequest(
             requestPayload.messages = ensureThinkingBeforeToolUseInMessages(requestPayload.messages, signatureSessionKey);
           }
 
-          deepFilterThinkingBlocks(requestPayload, signatureSessionKey, getCachedSignature);
-
+          // Step 3: Check if warmup needed (AFTER injection attempt)
           if (isClaudeThinkingModel) {
             const hasToolUse =
               (Array.isArray(requestPayload.contents) && hasToolUseInContents(requestPayload.contents)) ||

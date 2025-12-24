@@ -38,21 +38,42 @@ import type {
 
 const MAX_OAUTH_ACCOUNTS = 10;
 const MAX_WARMUP_SESSIONS = 1000;
+const MAX_WARMUP_RETRIES = 2;
 const warmupAttemptedSessionIds = new Set<string>();
+const warmupSucceededSessionIds = new Set<string>();
 
-function trackWarmupSession(sessionId: string): boolean {
-  if (warmupAttemptedSessionIds.has(sessionId)) {
+function trackWarmupAttempt(sessionId: string): boolean {
+  if (warmupSucceededSessionIds.has(sessionId)) {
     return false;
   }
   if (warmupAttemptedSessionIds.size >= MAX_WARMUP_SESSIONS) {
     const first = warmupAttemptedSessionIds.values().next().value;
-    if (first) warmupAttemptedSessionIds.delete(first);
+    if (first) {
+      warmupAttemptedSessionIds.delete(first);
+      warmupSucceededSessionIds.delete(first);
+    }
+  }
+  const attempts = getWarmupAttemptCount(sessionId);
+  if (attempts >= MAX_WARMUP_RETRIES) {
+    return false;
   }
   warmupAttemptedSessionIds.add(sessionId);
   return true;
 }
 
-function untrackWarmupSession(sessionId: string): void {
+function getWarmupAttemptCount(sessionId: string): number {
+  return warmupAttemptedSessionIds.has(sessionId) ? 1 : 0;
+}
+
+function markWarmupSuccess(sessionId: string): void {
+  warmupSucceededSessionIds.add(sessionId);
+  if (warmupSucceededSessionIds.size >= MAX_WARMUP_SESSIONS) {
+    const first = warmupSucceededSessionIds.values().next().value;
+    if (first) warmupSucceededSessionIds.delete(first);
+  }
+}
+
+function clearWarmupAttempt(sessionId: string): void {
   warmupAttemptedSessionIds.delete(sessionId);
 }
 
@@ -753,7 +774,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 return;
               }
 
-              if (!trackWarmupSession(prepared.sessionId)) {
+              if (!trackWarmupAttempt(prepared.sessionId)) {
                 return;
               }
 
@@ -800,9 +821,10 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   prepared.sessionId,
                 );
                 await transformed.text();
+                markWarmupSuccess(prepared.sessionId);
                 pushDebug("thinking-warmup: done");
               } catch (error) {
-                untrackWarmupSession(prepared.sessionId);
+                clearWarmupAttempt(prepared.sessionId);
                 pushDebug(
                   `thinking-warmup: failed ${error instanceof Error ? error.message : String(error)}`,
                 );

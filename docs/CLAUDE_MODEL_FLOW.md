@@ -1,6 +1,6 @@
 # Claude Model Flow: OpenCode → Plugin → Antigravity API
 
-**Version:** 1.1  
+**Version:** 2.0  
 **Last Updated:** December 2025  
 **Branches:** `claude-improvements`, `improve-tools-call-sanitizer`
 
@@ -150,32 +150,34 @@ These quirks handle Claude's requirement for signed thinking blocks in multi-tur
 
 | # | Quirk | Problem | Adaptation |
 |---|-------|---------|------------|
-| 13 | **Signature requirement** | Multi-turn needs signed thinking blocks or 400 error | Cache signatures by session ID + text hash |
-| 14 | **`cache_control` in thinking** | SDK injects, Claude rejects (400) | `stripCacheControlRecursively()` removes at any depth |
-| 15 | **`providerOptions` in thinking** | SDK injects, Claude rejects | Strip via `sanitizeThinkingPart()` |
-| 16 | **Wrapped `thinking` field** | SDK may wrap: `{ thinking: { text: "...", cache_control: {} } }` | Extract inner text string only |
-| 17 | **Trailing thinking blocks** | Claude rejects assistant messages ending with unsigned thinking | `removeTrailingThinkingBlocks()` with signature check |
-| 18 | **Unsigned blocks in history** | Claude rejects unsigned thinking in multi-turn | Filter out or restore signature from cache |
-| 19 | **Format variants** | Gemini: `thought: true`, Anthropic: `type: "thinking"` | Handle both formats in filtering logic |
+| 13 | **Signature requirement** | Multi-turn needs signed thinking blocks or 400 error | **Strip ALL thinking blocks** from outgoing requests |
+| 14 | **`cache_control` in thinking** | SDK injects, Claude rejects (400) | N/A - thinking blocks stripped entirely |
+| 15 | **`providerOptions` in thinking** | SDK injects, Claude rejects | N/A - thinking blocks stripped entirely |
+| 16 | **Wrapped `thinking` field** | SDK may wrap: `{ thinking: { text: "...", cache_control: {} } }` | N/A - thinking blocks stripped entirely |
+| 17 | **Trailing thinking blocks** | Claude rejects assistant messages ending with unsigned thinking | N/A - thinking blocks stripped entirely |
+| 18 | **Unsigned blocks in history** | Claude rejects unsigned thinking in multi-turn | N/A - thinking blocks stripped entirely |
+| 19 | **Format variants** | Gemini: `thought: true`, Anthropic: `type: "thinking"` | Both formats detected and stripped |
 
-**Thinking Part Sanitization (only these fields are kept):**
-- Gemini-style: `thought`, `text`, `thoughtSignature`
-- Anthropic-style: `type`, `thinking`, `signature`
+**v2.0 Approach: Strip All Thinking Blocks**
 
-**Example - SDK Injection Stripping:**
-```json
-// ❌ WRONG - SDK injected cache_control
-{
-  "type": "thinking",
-  "thinking": { "text": "Let me think...", "cache_control": { "type": "ephemeral" } }
-}
+Instead of complex signature caching/validation/restoration, we now unconditionally strip ALL thinking blocks from outgoing requests to Claude models. Claude generates fresh thinking each turn.
 
-// ✅ CORRECT - Sanitized by plugin
-{
-  "type": "thinking",
-  "thinking": "Let me think..."
-}
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│ INCOMING REQUEST (with potentially stale/invalid thinking)     │
+├─────────────────────────────────────────────────────────────────┤
+│  Text Blocks ─────────────────▶ KEEP (preserved)                │
+│  Tool Calls (functionCall) ───▶ KEEP (preserved)                │
+│  Tool Results (functionResponse) ▶ KEEP (preserved)             │
+│  Thinking Blocks ─────────────▶ STRIP (Claude re-thinks fresh)  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Why This Approach:**
+- Zero signature errors (impossible to have invalid signatures)
+- Same quality (Claude sees full conversation history, just not previous thinking)
+- Simpler code (no complex caching/matching logic)
+- Matches CLIProxyAPI behavior (stateless proxy, no signature caching)
 
 ### 4. Thinking Configuration Quirks
 
@@ -230,27 +232,33 @@ These quirks transform Claude/Antigravity responses to match OpenCode's expected
 
 ### 6. Session & Caching Quirks
 
-These quirks manage session continuity and signature caching across multi-turn conversations.
+These quirks manage session continuity across multi-turn conversations.
 
 | # | Quirk | Problem | Adaptation |
 |---|-------|---------|------------|
-| 29 | **Session continuity** | Signatures tied to session, lost on restart | Generate stable `PLUGIN_SESSION_ID` at plugin load |
-| 30 | **Request tracking** | Need consistent session across multi-turn | Inject `sessionId` into request payload |
-| 31 | **Signature extraction** | Need to cache signatures from streaming response | Extract `thoughtSignature` from SSE chunks as they arrive |
-| 32 | **Cache key** | Need stable lookup across turns | Hash by session ID + thinking text |
+| 29 | **Session continuity** | Need consistent session ID for debugging | Generate stable `PLUGIN_SESSION_ID` at plugin load |
+| 30 | **Request tracking** | Need to track requests for debugging | Inject `sessionId` into request payload |
+| 31 | **Signature extraction** | Cache signatures from response for debugging/display | Extract `thoughtSignature` from SSE chunks |
+| 32 | **Thinking block handling** | OpenCode may corrupt signatures in history | Strip all thinking blocks from requests (v2.0) |
 | 33 | **Cache limits** | Memory could grow unbounded | TTL: 1 hour, max 100 entries per session |
 
-**Signature Caching Flow:**
+**v2.0 Thinking Block Flow:**
 ```
 Turn 1 (Response):
   Claude returns: { thought: true, text: "...", thoughtSignature: "abc123..." }
-  Plugin caches: hash("...") → "abc123..."
+  Plugin caches signature for debugging/display only
 
 Turn 2 (Request):
-  OpenCode sends thinking block without signature
-  Plugin looks up: hash("...") → "abc123..."
-  Plugin restores signature before sending to Antigravity
+  OpenCode sends thinking block (possibly corrupted)
+  Plugin STRIPS all thinking blocks unconditionally
+  Claude generates FRESH thinking for this turn
 ```
+
+**Why Strip Instead of Restore:**
+- OpenCode may modify thinking blocks (add cache_control, wrap in objects)
+- Signatures become invalid when thinking blocks are modified
+- Signature restoration had too many edge cases
+- CLIProxyAPI also doesn't restore signatures (stateless proxy)
 
 ### 7. Error Handling Quirks
 
@@ -351,7 +359,7 @@ Entry point. Intercepts `fetch()` for `generativelanguage.googleapis.com` reques
 
 | Error | Cause | Solution |
 |-------|-------|----------|
-| `invalid thinking signature` | Signature lost in multi-turn | Restart `opencode` to reset signature cache |
+| `invalid thinking signature` | Should not occur in v2.0 | Update plugin to latest version (strips all thinking) |
 | `Unknown field: cache_control` | SDK injected unsupported field | Plugin auto-strips; update plugin if persists |
 | `Unknown field: const` | Schema uses `const` keyword | Plugin auto-converts to `enum`; check schema |
 | `Unknown field: $ref` | Schema uses JSON Schema references | Inline the referenced schema instead |
@@ -385,6 +393,7 @@ Entry point. Intercepts `fetch()` for `generativelanguage.googleapis.com` reques
 
 | Version | Description |
 |---------|-------------|
+| 2.0 | **Breaking change**: Strip all thinking blocks for Claude models instead of signature caching/restoration. Eliminates signature errors entirely. |
 | 1.1 | Added comprehensive "Claude-Specific Quirks & Adaptations" section with 36 quirks |
 | 1.0 | Initial documentation with flow diagram and branch summaries |
 
