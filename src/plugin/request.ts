@@ -1110,6 +1110,9 @@ export function prepareAntigravityRequest(
         // Attempts to restore signatures from cache for multi-turn conversations
         // Handle both Gemini-style contents[] and Anthropic-style messages[] payloads.
         if (isClaude) {
+          // Step 0: Sanitize cross-model metadata (strips Gemini signatures when sending to Claude)
+          sanitizeCrossModelPayloadInPlace(requestPayload, { targetModel: effectiveModel });
+
           // Step 1: Strip corrupted/unsigned thinking blocks FIRST
           deepFilterThinkingBlocks(requestPayload, signatureSessionKey, getCachedSignature, true);
 
