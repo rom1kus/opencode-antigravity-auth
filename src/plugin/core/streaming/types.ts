@@ -13,6 +13,7 @@ export interface SignatureStore {
 export interface StreamingCallbacks {
   onCacheSignature?: (sessionKey: string, text: string, signature: string) => void;
   onInjectDebug?: (response: unknown, debugText: string) => unknown;
+  onInjectSyntheticThinking?: (response: unknown) => unknown;
   transformThinkingParts?: (parts: unknown) => unknown;
 }
 
@@ -21,6 +22,8 @@ export interface StreamingOptions {
   debugText?: string;
   cacheSignatures?: boolean;
   displayedThinkingHashes?: Set<string>;
+  /** When true, injects synthetic thinking placeholder for keep_thinking multi-turn support */
+  injectSyntheticThinking?: boolean;
 }
 
 export interface ThoughtBuffer {

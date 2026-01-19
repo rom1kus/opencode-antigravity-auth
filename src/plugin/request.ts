@@ -10,6 +10,7 @@ import {
   type HeaderStyle,
 } from "../constants";
 import { cacheSignature, getCachedSignature } from "./cache";
+import { getKeepThinking } from "./config";
 import {
   createStreamingTransformer,
   transformSseLine,
@@ -182,9 +183,9 @@ function resolveConversationKey(requestPayload: Record<string, unknown>): string
 
   const systemSeed = extractTextFromContent(
     (anyPayload.systemInstruction as any)?.parts
-      ?? anyPayload.systemInstruction
-      ?? anyPayload.system
-      ?? anyPayload.system_instruction,
+    ?? anyPayload.systemInstruction
+    ?? anyPayload.system
+    ?? anyPayload.system_instruction,
   );
   const messageSeed = Array.isArray(anyPayload.messages)
     ? extractConversationSeedFromMessages(anyPayload.messages)
@@ -259,6 +260,70 @@ function injectDebugThinking(response: unknown, debugText: string): unknown {
 
   if (!resp.reasoning_content) {
     return { ...resp, reasoning_content: debugText };
+  }
+
+  return resp;
+}
+
+/**
+ * Synthetic thinking placeholder text used when keep_thinking=true but debug mode is off.
+ * This ensures Claude multi-turn conversations work correctly by triggering the 
+ * SKIP_THOUGHT_SIGNATURE sentinel injection in filterContentArray on the next turn.
+ */
+const SYNTHETIC_THINKING_PLACEHOLDER = "[Thinking preserved]\n";
+
+/**
+ * Injects a minimal synthetic thinking block when keep_thinking=true.
+ * This is needed for Claude multi-turn because:
+ * 1. When the response comes back on next turn, filterContentArray sees the thinking block
+ * 2. If it has no valid signature, it injects SKIP_THOUGHT_SIGNATURE sentinel
+ * 3. This allows Claude to accept the conversation history without signature validation errors
+ */
+function injectSyntheticThinkingForKeepThinking(response: unknown): unknown {
+  if (!response || typeof response !== "object") {
+    return response;
+  }
+
+  const resp = response as any;
+
+  // For Claude responses (resp.content array)
+  if (Array.isArray(resp.content)) {
+    // Check if there's already a thinking block - don't inject duplicate
+    const hasThinking = resp.content.some((block: any) =>
+      block && typeof block === "object" && block.type === "thinking"
+    );
+    if (hasThinking) {
+      return resp;
+    }
+
+    const content = [{ type: "thinking", thinking: SYNTHETIC_THINKING_PLACEHOLDER }, ...resp.content];
+    return { ...resp, content };
+  }
+
+  // For Gemini responses (resp.candidates array)
+  if (Array.isArray(resp.candidates) && resp.candidates.length > 0) {
+    const candidates = resp.candidates.slice();
+    const first = candidates[0];
+
+    if (
+      first &&
+      typeof first === "object" &&
+      first.content &&
+      typeof first.content === "object" &&
+      Array.isArray(first.content.parts)
+    ) {
+      // Check if there's already a thinking part
+      const hasThinking = first.content.parts.some((part: any) =>
+        part && typeof part === "object" && (part.thought === true || part.type === "thinking")
+      );
+      if (hasThinking) {
+        return resp;
+      }
+
+      const parts = [{ thought: true, text: SYNTHETIC_THINKING_PLACEHOLDER }, ...first.content.parts];
+      candidates[0] = { ...first, content: { ...first.content, parts } };
+      return { ...resp, candidates };
+    }
   }
 
   return resp;
@@ -649,10 +714,10 @@ export function prepareAntigravityRequest(
   const defaultEndpoint = headerStyle === "gemini-cli" ? GEMINI_CLI_ENDPOINT : ANTIGRAVITY_ENDPOINT;
   const baseEndpoint = endpointOverride ?? defaultEndpoint;
   const transformedUrl = `${baseEndpoint}/v1internal:${rawAction}${streaming ? "?alt=sse" : ""}`;
-    
+
   const isClaude = isClaudeModel(resolved.actualModel);
   const isClaudeThinking = isClaudeThinkingModel(resolved.actualModel);
-  
+
   // Tier-based thinking configuration from model resolver (can be overridden by variant config)
   let tierThinkingBudget = resolved.thinkingBudget;
   let tierThinkingLevel = resolved.thinkingLevel;
@@ -748,7 +813,7 @@ export function prepareAntigravityRequest(
           requestPayload.providerOptions as Record<string, unknown> | undefined
         );
         const isGemini3 = effectiveModel.toLowerCase().includes("gemini-3");
-        
+
         if (variantConfig?.thinkingLevel && isGemini3) {
           // Gemini 3 native format - use thinkingLevel directly
           tierThinkingLevel = variantConfig.thinkingLevel;
@@ -757,7 +822,7 @@ export function prepareAntigravityRequest(
           if (isGemini3) {
             // Legacy format for Gemini 3 - convert with deprecation warning
             log.warn("[Deprecated] Using thinkingBudget for Gemini 3 model. Use thinkingLevel instead.");
-            tierThinkingLevel = variantConfig.thinkingBudget <= 8192 ? "low" 
+            tierThinkingLevel = variantConfig.thinkingBudget <= 8192 ? "low"
               : variantConfig.thinkingBudget <= 16384 ? "medium" : "high";
             tierThinkingBudget = undefined;
           } else {
@@ -806,7 +871,7 @@ export function prepareAntigravityRequest(
             generationConfig.candidateCount = 1;
           }
           requestPayload.generationConfig = generationConfig;
-          
+
           // Add safety settings for image generation (permissive to allow creative content)
           if (!requestPayload.safetySettings) {
             requestPayload.safetySettings = [
@@ -817,11 +882,11 @@ export function prepareAntigravityRequest(
               { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_ONLY_HIGH" },
             ];
           }
-          
+
           // Image models don't support tools - remove them entirely
           delete requestPayload.tools;
           delete requestPayload.toolConfig;
-          
+
           // Replace system instruction with a simple image generation prompt
           // Image models should not receive agentic coding assistant instructions
           requestPayload.systemInstruction = {
@@ -829,69 +894,69 @@ export function prepareAntigravityRequest(
           };
         } else {
           const finalThinkingConfig = resolveThinkingConfig(
-          effectiveUserThinkingConfig,
-          isClaudeSonnetNonThinking ? false : (resolved.isThinkingModel ?? isThinkingCapableModel(effectiveModel)),
-          isClaude,
-          hasAssistantHistory,
-        );
+            effectiveUserThinkingConfig,
+            isClaudeSonnetNonThinking ? false : (resolved.isThinkingModel ?? isThinkingCapableModel(effectiveModel)),
+            isClaude,
+            hasAssistantHistory,
+          );
 
-        const normalizedThinking = normalizeThinkingConfig(finalThinkingConfig);
-        if (normalizedThinking) {
-          // Use tier-based thinking budget if specified via model suffix, otherwise fall back to user config
-          const thinkingBudget = tierThinkingBudget ?? normalizedThinking.thinkingBudget;
-          
-          // Build thinking config based on model type
-          let thinkingConfig: Record<string, unknown>;
-          
-          if (isClaudeThinking) {
-            // Claude uses snake_case keys
-            thinkingConfig = {
-              include_thoughts: normalizedThinking.includeThoughts ?? true,
-              ...(typeof thinkingBudget === "number" && thinkingBudget > 0
-                ? { thinking_budget: thinkingBudget }
-                : {}),
-            };
-          } else if (tierThinkingLevel) {
-            // Gemini 3 uses thinkingLevel string (low/medium/high)
-            thinkingConfig = {
-              includeThoughts: normalizedThinking.includeThoughts,
-              thinkingLevel: tierThinkingLevel,
-            };
-          } else {
-            // Gemini 2.5 and others use numeric budget
-            thinkingConfig = {
-              includeThoughts: normalizedThinking.includeThoughts,
-              ...(typeof thinkingBudget === "number" && thinkingBudget > 0 ? { thinkingBudget } : {}),
-            };
-          }
+          const normalizedThinking = normalizeThinkingConfig(finalThinkingConfig);
+          if (normalizedThinking) {
+            // Use tier-based thinking budget if specified via model suffix, otherwise fall back to user config
+            const thinkingBudget = tierThinkingBudget ?? normalizedThinking.thinkingBudget;
 
-          if (rawGenerationConfig) {
-            rawGenerationConfig.thinkingConfig = thinkingConfig;
+            // Build thinking config based on model type
+            let thinkingConfig: Record<string, unknown>;
 
-            if (isClaudeThinking && typeof thinkingBudget === "number" && thinkingBudget > 0) {
-              const currentMax = (rawGenerationConfig.maxOutputTokens ?? rawGenerationConfig.max_output_tokens) as number | undefined;
-              if (!currentMax || currentMax <= thinkingBudget) {
-                rawGenerationConfig.maxOutputTokens = CLAUDE_THINKING_MAX_OUTPUT_TOKENS;
-                if (rawGenerationConfig.max_output_tokens !== undefined) {
-                  delete rawGenerationConfig.max_output_tokens;
+            if (isClaudeThinking) {
+              // Claude uses snake_case keys
+              thinkingConfig = {
+                include_thoughts: normalizedThinking.includeThoughts ?? true,
+                ...(typeof thinkingBudget === "number" && thinkingBudget > 0
+                  ? { thinking_budget: thinkingBudget }
+                  : {}),
+              };
+            } else if (tierThinkingLevel) {
+              // Gemini 3 uses thinkingLevel string (low/medium/high)
+              thinkingConfig = {
+                includeThoughts: normalizedThinking.includeThoughts,
+                thinkingLevel: tierThinkingLevel,
+              };
+            } else {
+              // Gemini 2.5 and others use numeric budget
+              thinkingConfig = {
+                includeThoughts: normalizedThinking.includeThoughts,
+                ...(typeof thinkingBudget === "number" && thinkingBudget > 0 ? { thinkingBudget } : {}),
+              };
+            }
+
+            if (rawGenerationConfig) {
+              rawGenerationConfig.thinkingConfig = thinkingConfig;
+
+              if (isClaudeThinking && typeof thinkingBudget === "number" && thinkingBudget > 0) {
+                const currentMax = (rawGenerationConfig.maxOutputTokens ?? rawGenerationConfig.max_output_tokens) as number | undefined;
+                if (!currentMax || currentMax <= thinkingBudget) {
+                  rawGenerationConfig.maxOutputTokens = CLAUDE_THINKING_MAX_OUTPUT_TOKENS;
+                  if (rawGenerationConfig.max_output_tokens !== undefined) {
+                    delete rawGenerationConfig.max_output_tokens;
+                  }
                 }
               }
-            }
 
+              requestPayload.generationConfig = rawGenerationConfig;
+            } else {
+              const generationConfig: Record<string, unknown> = { thinkingConfig };
+
+              if (isClaudeThinking && typeof thinkingBudget === "number" && thinkingBudget > 0) {
+                generationConfig.maxOutputTokens = CLAUDE_THINKING_MAX_OUTPUT_TOKENS;
+              }
+
+              requestPayload.generationConfig = generationConfig;
+            }
+          } else if (rawGenerationConfig?.thinkingConfig) {
+            delete rawGenerationConfig.thinkingConfig;
             requestPayload.generationConfig = rawGenerationConfig;
-          } else {
-            const generationConfig: Record<string, unknown> = { thinkingConfig };
-
-            if (isClaudeThinking && typeof thinkingBudget === "number" && thinkingBudget > 0) {
-              generationConfig.maxOutputTokens = CLAUDE_THINKING_MAX_OUTPUT_TOKENS;
-            }
-
-            requestPayload.generationConfig = generationConfig;
           }
-        } else if (rawGenerationConfig?.thinkingConfig) {
-          delete rawGenerationConfig.thinkingConfig;
-          requestPayload.generationConfig = rawGenerationConfig;
-        }
         } // End of else block for non-image models
 
         // Clean up thinking fields from extra_body
@@ -1101,9 +1166,9 @@ export function prepareAntigravityRequest(
           } else {
             // Gemini-specific tool normalization and feature injection
             // Resolve Google Search config: Variant takes precedence over global default
-            const effectiveSearchConfig: GoogleSearchConfig | undefined = 
+            const effectiveSearchConfig: GoogleSearchConfig | undefined =
               variantConfig?.googleSearch ?? options?.googleSearch;
-              
+
             const geminiResult = applyGeminiTransforms(requestPayload, {
               model: effectiveModel,
               normalizedThinking: undefined, // Thinking config already applied above (lines 816-880)
@@ -1111,7 +1176,7 @@ export function prepareAntigravityRequest(
               tierThinkingLevel: tierThinkingLevel as ThinkingTier | undefined,
               googleSearch: effectiveSearchConfig,
             });
-            
+
             toolDebugMissing = geminiResult.toolDebugMissing;
             toolDebugSummaries.push(...geminiResult.toolDebugSummaries);
           }
@@ -1488,6 +1553,7 @@ export async function transformAntigravityResponse(
       {
         onCacheSignature: cacheSignature,
         onInjectDebug: injectDebugThinking,
+        onInjectSyntheticThinking: injectSyntheticThinkingForKeepThinking,
         transformThinkingParts,
       },
       {
@@ -1495,6 +1561,9 @@ export async function transformAntigravityResponse(
         debugText,
         cacheSignatures,
         displayedThinkingHashes: effectiveModel && isGemini3Model(effectiveModel) ? sessionDisplayedThinkingHashes : undefined,
+        // Inject synthetic thinking when keep_thinking=true but debug is off
+        // This ensures Claude multi-turn works without needing OPENCODE_ANTIGRAVITY_DEBUG=2
+        injectSyntheticThinking: getKeepThinking() && !debugText,
       },
     );
     return new Response(response.body.pipeThrough(streamingTransformer), {
@@ -1618,7 +1687,15 @@ export async function transformAntigravityResponse(
     }
 
     if (effectiveBody?.response !== undefined) {
-      const responseBody = debugText ? injectDebugThinking(effectiveBody.response, debugText) : effectiveBody.response;
+      let responseBody: unknown = effectiveBody.response;
+      // Inject debug thinking if debug mode is on
+      if (debugText) {
+        responseBody = injectDebugThinking(responseBody, debugText);
+      }
+      // Inject synthetic thinking if keep_thinking=true but no debug injection
+      else if (getKeepThinking()) {
+        responseBody = injectSyntheticThinkingForKeepThinking(responseBody);
+      }
       const transformed = transformThinkingParts(responseBody);
       return new Response(JSON.stringify(transformed), init);
     }

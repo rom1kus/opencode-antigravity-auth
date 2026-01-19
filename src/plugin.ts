@@ -862,8 +862,13 @@ export const createAntigravityPlugin = (providerId: string) => async (
             }
           };
 
-          // Helper to show toast without blocking on abort
+          // Use while(true) loop to handle rate limits with backoff
+          // This ensures we wait and retry when all accounts are rate-limited
+          const quietMode = config.quiet_mode;
+
+          // Helper to show toast without blocking on abort (respects quiet_mode)
           const showToast = async (message: string, variant: "info" | "warning" | "success" | "error") => {
+            if (quietMode) return;
             if (abortSignal?.aborted) return;
             try {
               await client.tui.showToast({
@@ -873,10 +878,6 @@ export const createAntigravityPlugin = (providerId: string) => async (
               // TUI may not be available
             }
           };
-
-          // Use while(true) loop to handle rate limits with backoff
-          // This ensures we wait and retry when all accounts are rate-limited
-          const quietMode = config.quiet_mode;
           
           const hasOtherAccountWithAntigravity = (currentAccount: any): boolean => {
             if (family !== "gemini") return false;
@@ -964,8 +965,8 @@ export const createAntigravityPlugin = (providerId: string) => async (
               });
             }
 
-            // Show toast when switching to a different account (debounced, respects quiet mode)
-            if (!quietMode && accountCount > 1 && accountManager.shouldShowAccountToast(account.index)) {
+            // Show toast when switching to a different account (debounced, quiet_mode handled by showToast)
+            if (accountCount > 1 && accountManager.shouldShowAccountToast(account.index)) {
               const accountLabel = account.email || `Account ${account.index + 1}`;
               await showToast(
                 `Using ${accountLabel} (${account.index + 1}/${accountCount})`,
@@ -1162,12 +1163,10 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 if (alternateStyle && alternateStyle !== headerStyle) {
                   const quotaName = headerStyle === "gemini-cli" ? "Gemini CLI" : "Antigravity";
                   const altQuotaName = alternateStyle === "gemini-cli" ? "Gemini CLI" : "Antigravity";
-                  if (!quietMode) {
-                    await showToast(
-                      `${quotaName} quota exhausted, using ${altQuotaName} quota`,
-                      "warning"
-                    );
-                  }
+                  await showToast(
+                    `${quotaName} quota exhausted, using ${altQuotaName} quota`,
+                    "warning"
+                  );
                   headerStyle = alternateStyle;
                   pushDebug(`quota fallback: ${headerStyle}`);
                 } else {
@@ -1454,12 +1453,10 @@ export const createAntigravityPlugin = (providerId: string) => async (
                     const cloned = response.clone();
                     const bodyText = await cloned.text();
                     if (bodyText.includes("Prompt is too long") || bodyText.includes("prompt_too_long")) {
-                      if (!quietMode) {
-                        await showToast(
-                          "Context too long - use /compact to reduce size",
-                          "warning"
-                        );
-                      }
+                      await showToast(
+                        "Context too long - use /compact to reduce size",
+                        "warning"
+                      );
                       const errorMessage = `[Antigravity Error] Context is too long for this model.\n\nPlease use /compact to reduce context size, then retry your request.\n\nAlternatively, you can:\n- Use /clear to start fresh\n- Use /undo to remove recent messages\n- Switch to a model with larger context window`;
                       return createSyntheticErrorResponse(errorMessage, prepared.requestedModel);
                     }
@@ -1525,7 +1522,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
                 // Check for context errors and show appropriate toast
                 const contextError = transformedResponse.headers.get("x-antigravity-context-error");
-                if (contextError && !quietMode) {
+                if (contextError) {
                   if (contextError === "prompt_too_long") {
                     await showToast(
                       "Context too long - use /compact to reduce size, or trim your request",

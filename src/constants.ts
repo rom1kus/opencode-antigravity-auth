@@ -71,14 +71,14 @@ export const GEMINI_CLI_ENDPOINT = ANTIGRAVITY_ENDPOINT_PROD;
 export const ANTIGRAVITY_DEFAULT_PROJECT_ID = "rising-fact-p41fc";
 
 export const ANTIGRAVITY_HEADERS = {
-  "User-Agent": "antigravity/1.11.5 windows/amd64",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.104.0 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36",
   "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
   "Client-Metadata": '{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}',
 } as const;
 
 export const GEMINI_CLI_HEADERS = {
-  "User-Agent": "google-api-nodejs-client/9.15.1",
-  "X-Goog-Api-Client": "gl-node/22.17.0",
+  "User-Agent": "google-api-nodejs-client/10.3.0",
+  "X-Goog-Api-Client": "gl-node/22.18.0",
   "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
 } as const;
 
