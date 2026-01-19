@@ -352,7 +352,7 @@ async function persistAccountPool(
   });
 }
 
-function retryAfterMsFromResponse(response: Response): number {
+function retryAfterMsFromResponse(response: Response, defaultRetryMs: number = 60_000): number {
   const retryAfterMsHeader = response.headers.get("retry-after-ms");
   if (retryAfterMsHeader) {
     const parsed = Number.parseInt(retryAfterMsHeader, 10);
@@ -369,7 +369,7 @@ function retryAfterMsFromResponse(response: Response): number {
     }
   }
 
-  return 60_000;
+  return defaultRetryMs;
 }
 
 function parseDurationToMs(duration: string): number | null {
@@ -527,12 +527,14 @@ const emptyResponseAttempts = new Map<string, number>();
  * @param accountIndex - The account index
  * @param quotaKey - The quota key (e.g., "gemini-cli", "gemini-antigravity", "claude")
  * @param serverRetryAfterMs - Server-provided retry delay (if any)
+ * @param maxBackoffMs - Maximum backoff delay in milliseconds (default 60000)
  * @returns { attempt, delayMs, isDuplicate } - isDuplicate=true if within dedup window
  */
 function getRateLimitBackoff(
   accountIndex: number, 
   quotaKey: string,
-  serverRetryAfterMs: number | null
+  serverRetryAfterMs: number | null,
+  maxBackoffMs: number = 60_000
 ): { attempt: number; delayMs: number; isDuplicate: boolean } {
   const now = Date.now();
   const stateKey = `${accountIndex}:${quotaKey}`;
@@ -542,7 +544,7 @@ function getRateLimitBackoff(
   if (previous && (now - previous.lastAt < RATE_LIMIT_DEDUP_WINDOW_MS)) {
     // Same rate limit event from concurrent request - don't increment
     const baseDelay = serverRetryAfterMs ?? 1000;
-    const backoffDelay = Math.min(baseDelay * Math.pow(2, previous.consecutive429 - 1), 60_000);
+    const backoffDelay = Math.min(baseDelay * Math.pow(2, previous.consecutive429 - 1), maxBackoffMs);
     return { 
       attempt: previous.consecutive429, 
       delayMs: Math.max(baseDelay, backoffDelay),
@@ -562,7 +564,7 @@ function getRateLimitBackoff(
   });
   
   const baseDelay = serverRetryAfterMs ?? 1000;
-  const backoffDelay = Math.min(baseDelay * Math.pow(2, attempt - 1), 60_000);
+  const backoffDelay = Math.min(baseDelay * Math.pow(2, attempt - 1), maxBackoffMs);
   return { attempt, delayMs: Math.max(baseDelay, backoffDelay), isDuplicate: false };
 }
 
@@ -1241,11 +1243,13 @@ export const createAntigravityPlugin = (providerId: string) => async (
                     tokenConsumed = false;
                   }
 
-                  const headerRetryMs = retryAfterMsFromResponse(response);
+                  const defaultRetryMs = (config.default_retry_after_seconds ?? 60) * 1000;
+                  const maxBackoffMs = (config.max_backoff_seconds ?? 60) * 1000;
+                  const headerRetryMs = retryAfterMsFromResponse(response, defaultRetryMs);
                   const bodyInfo = await extractRetryInfoFromBody(response);
                   const serverRetryMs = bodyInfo.retryDelayMs ?? headerRetryMs;
                   const quotaKey = headerStyleToQuotaKey(headerStyle, family);
-                  const { attempt, delayMs, isDuplicate } = getRateLimitBackoff(account.index, quotaKey, serverRetryMs);
+                  const { attempt, delayMs, isDuplicate } = getRateLimitBackoff(account.index, quotaKey, serverRetryMs, maxBackoffMs);
 
                   const rateLimitReason = parseRateLimitReason(bodyInfo.reason, bodyInfo.message);
                   const smartBackoffMs = calculateBackoffMs(rateLimitReason, account.consecutiveFailures ?? 0, serverRetryMs);
