@@ -21,6 +21,7 @@ const log = createLogger("storage");
 export const GITIGNORE_ENTRIES = [
   ".gitignore",
   "antigravity-accounts.json",
+  "antigravity-accounts.json.*.tmp",
   "antigravity-signature-cache.json",
   "antigravity-logs/",
 ];
@@ -530,8 +531,18 @@ export async function saveAccounts(storage: AccountStorageV3): Promise<void> {
     const tempPath = `${path}.${randomBytes(6).toString("hex")}.tmp`;
     const content = JSON.stringify(merged, null, 2);
 
-    await fs.writeFile(tempPath, content, "utf-8");
-    await fs.rename(tempPath, path);
+    try {
+      await fs.writeFile(tempPath, content, "utf-8");
+      await fs.rename(tempPath, path);
+    } catch (error) {
+      // Clean up temp file on failure to prevent accumulation
+      try {
+        await fs.unlink(tempPath);
+      } catch {
+        // Ignore cleanup errors (file may not exist)
+      }
+      throw error;
+    }
   });
 }
 
