@@ -317,6 +317,15 @@ export const AntigravityConfigSchema = z.object({
     */
    max_backoff_seconds: z.number().min(5).max(300).default(60),
    
+   /**
+    * Maximum random delay in milliseconds before each API request.
+    * Adds timing jitter to break predictable request cadence patterns.
+    * Set to 0 to disable request jitter.
+    * 
+    * @default 0
+    */
+   request_jitter_max_ms: z.number().min(0).max(5000).default(0),
+   
    // =========================================================================
    // Health Score (used by hybrid strategy)
    // =========================================================================
@@ -383,6 +392,7 @@ export const DEFAULT_CONFIG: AntigravityConfig = {
   failure_ttl_seconds: 3600,
   default_retry_after_seconds: 60,
   max_backoff_seconds: 60,
+  request_jitter_max_ms: 0,
   auto_update: true,
   signature_cache: {
     enabled: true,

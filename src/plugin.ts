@@ -1322,6 +1322,13 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
                 await runThinkingWarmup(prepared, projectContext.effectiveProjectId);
 
+                if (config.request_jitter_max_ms > 0) {
+                  const jitterMs = Math.floor(Math.random() * config.request_jitter_max_ms);
+                  if (jitterMs > 0) {
+                    await sleep(jitterMs, abortSignal);
+                  }
+                }
+
                 // Consume token for hybrid strategy
                 // Refunded later if request fails (429 or network error)
                 if (config.account_selection_strategy === 'hybrid') {
