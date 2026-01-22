@@ -3,7 +3,7 @@ import { loadAccounts, saveAccounts, type AccountStorageV3, type RateLimitStateV
 import type { OAuthAuthDetails, RefreshParts } from "./types";
 import type { AccountSelectionStrategy } from "./config/schema";
 import { getHealthTracker, getTokenTracker, selectHybridAccount, type AccountWithMetrics } from "./rotation";
-import { generateFingerprint, type Fingerprint } from "./fingerprint";
+import { generateFingerprint, type Fingerprint, type FingerprintVersion, MAX_FINGERPRINT_HISTORY } from "./fingerprint";
 
 export type { ModelFamily, HeaderStyle, CooldownReason } from "./storage";
 export type { AccountSelectionStrategy } from "./config/schema";
@@ -127,7 +127,7 @@ export interface ManagedAccount {
   /** Per-account device fingerprint for rate limit mitigation */
   fingerprint?: import("./fingerprint").Fingerprint;
   /** History of previous fingerprints for this account */
-  fingerprintHistory?: import("./fingerprint").FingerprintVersion[];
+  fingerprintHistory?: FingerprintVersion[];
 }
 
 function nowMs(): number {
@@ -751,6 +751,7 @@ export class AccountManager {
         coolingDownUntil: a.coolingDownUntil,
         cooldownReason: a.cooldownReason,
         fingerprint: a.fingerprint,
+        fingerprintHistory: a.fingerprintHistory?.length ? a.fingerprintHistory : undefined,
       })),
       activeIndex: claudeIndex,
       activeIndexByFamily: {
@@ -796,5 +797,97 @@ export class AccountManager {
         resolve();
       }
     }
+  }
+
+  // ========== Fingerprint Management ==========
+
+  /**
+   * Regenerate fingerprint for an account, saving the old one to history.
+   * @param accountIndex - Index of the account to regenerate fingerprint for
+   * @returns The new fingerprint, or null if account not found
+   */
+  regenerateAccountFingerprint(accountIndex: number): Fingerprint | null {
+    const account = this.accounts[accountIndex];
+    if (!account) return null;
+    
+    // Save current fingerprint to history if it exists
+    if (account.fingerprint) {
+      const historyEntry: FingerprintVersion = {
+        fingerprint: account.fingerprint,
+        timestamp: nowMs(),
+        reason: 'regenerated',
+      };
+      
+      if (!account.fingerprintHistory) {
+        account.fingerprintHistory = [];
+      }
+      
+      // Add to beginning of history (most recent first)
+      account.fingerprintHistory.unshift(historyEntry);
+      
+      // Trim to max history size
+      if (account.fingerprintHistory.length > MAX_FINGERPRINT_HISTORY) {
+        account.fingerprintHistory = account.fingerprintHistory.slice(0, MAX_FINGERPRINT_HISTORY);
+      }
+    }
+
+    // Generate and assign new fingerprint
+    account.fingerprint = generateFingerprint();
+    this.requestSaveToDisk();
+    
+    return account.fingerprint;
+  }
+
+  /**
+   * Restore a fingerprint from history for an account.
+   * @param accountIndex - Index of the account
+   * @param historyIndex - Index in the fingerprint history to restore from (0 = most recent)
+   * @returns The restored fingerprint, or null if account/history not found
+   */
+  restoreAccountFingerprint(accountIndex: number, historyIndex: number): Fingerprint | null {
+    const account = this.accounts[accountIndex];
+    if (!account) return null;
+
+    const history = account.fingerprintHistory;
+    if (!history || historyIndex < 0 || historyIndex >= history.length) {
+      return null;
+    }
+    
+    // Save current fingerprint to history before restoring (if it exists)
+    if (account.fingerprint) {
+      const historyEntry: FingerprintVersion = {
+        fingerprint: account.fingerprint,
+        timestamp: nowMs(),
+        reason: 'restored',
+      };
+      
+      account.fingerprintHistory!.unshift(historyEntry);
+      
+      // Trim to max history size
+      if (account.fingerprintHistory!.length > MAX_FINGERPRINT_HISTORY) {
+        account.fingerprintHistory = account.fingerprintHistory!.slice(0, MAX_FINGERPRINT_HISTORY);
+      }
+    }
+
+    // Restore the fingerprint from history
+    const restoredFingerprint = history[historyIndex]!.fingerprint;
+    account.fingerprint = { ...restoredFingerprint, createdAt: nowMs() };
+    
+    this.requestSaveToDisk();
+    
+    return account.fingerprint;
+  }
+
+  /**
+   * Get fingerprint history for an account.
+   * @param accountIndex - Index of the account
+   * @returns Array of fingerprint versions, or empty array if not found
+   */
+  getAccountFingerprintHistory(accountIndex: number): FingerprintVersion[] {
+    const account = this.accounts[accountIndex];
+    if (!account || !account.fingerprintHistory) {
+      return [];
+    }
+    return [...account.fingerprintHistory];
   }
 }
